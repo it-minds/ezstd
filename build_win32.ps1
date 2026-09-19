@@ -1,6 +1,6 @@
 # Builds priv/ezstd_nif.dll on Windows with Zig (https://ziglang.org), which carries its
 # own C/C++ toolchain and the mingw-w64 headers, so nothing else has to be installed:
-# no Visual Studio, no MSYS2. rebar.config runs this as the `win32` compile hook, the
+# no Visual Studio, no MSYS2. rebar.config runs this as the Windows compile hook, the
 # way `make compile_nif` runs on Linux and macOS.
 #
 # zstd itself is fetched at the commit `ZSTD_SHA` in build_deps.sh names (one pin for
@@ -39,6 +39,20 @@ function Invoke-Checked {
     & $Exe @Arguments
     if ($LASTEXITCODE -ne 0) {
         throw "ezstd: '$Exe $($Arguments -join ' ')' failed with exit code $LASTEXITCODE"
+    }
+}
+
+# Runs a command with its output captured, and shows that output only if it fails.
+function Invoke-Quiet {
+    param([string]$Exe, [string[]]$Arguments)
+    $out = Join-Path $build 'quiet.out'
+    $err = Join-Path $build 'quiet.err'
+    $quoted = $Arguments | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }
+    $p = Start-Process -FilePath $Exe -ArgumentList $quoted -NoNewWindow -Wait -PassThru `
+        -RedirectStandardOutput $out -RedirectStandardError $err
+    if ($p.ExitCode -ne 0) {
+        Get-Content $out, $err -ErrorAction SilentlyContinue | Write-Host
+        throw "ezstd: '$Exe $($Arguments -join ' ')' failed with exit code $($p.ExitCode)"
     }
 }
 
@@ -112,14 +126,28 @@ foreach ($sub in 'common', 'compress', 'decompress', 'dictBuilder') {
     }
 }
 
+# The NIF is C++ (std::unique_ptr, new[]), so the link needs libc++, which Zig compiles
+# from its bundled sources the first time it links it for a target and a set of flags.
+# While it does, it echoes some forty thousand warning lines from those sources, none of
+# them ours, and Travis kills a job whose log passes 4 MB. So it is built once here, on a
+# one-line file with the same flags, with the output kept unless it fails; the real link
+# below then finds it in the cache and prints only its own diagnostics.
+$cxxflags = @('-target', $target, '-O3', '-DNDEBUG', '-std=c++11', '-fno-exceptions', '-fno-rtti')
+$warm = Join-Path $build 'libcxx_warmup.cc'
+Set-Content -Path $warm -Encoding ascii -Value @(
+    '#include <memory>',
+    'extern "C" int ezstd_warmup() { std::unique_ptr<int[]> p(new int[1]); return p ? 0 : 1; }'
+)
+Write-Host "ezstd: preparing libc++ for $target"
+Invoke-Quiet zig (@('c++') + $cxxflags + @('-shared', '-s', '-o', (Join-Path $build 'libcxx_warmup.dll'), $warm))
+
 Write-Host "ezstd: linking $output ($target)"
-$cxxflags = @(
-    '-target', $target, '-O3', '-DNDEBUG', '-std=c++11', '-fno-exceptions', '-fno-rtti',
+$linkflags = $cxxflags + @(
     '-Wall', '-Wextra', '-Wno-missing-field-initializers', '-Wno-nullability-completeness',
     "-I$ertsInclude", "-I$zstdLib", '-shared', '-s', '-o', $output,
     (Join-Path $root 'c_src\ezstd_nif.cc'), (Join-Path $root 'c_src\nif_utils.cc')
 )
-Invoke-Checked zig (@('c++') + $cxxflags + $objects)
+Invoke-Checked zig (@('c++') + $linkflags + $objects)
 
 # The linker leaves an import library and a debug file beside the DLL; neither is loaded.
 Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $privDir 'ezstd_nif.lib'), (Join-Path $privDir 'ezstd_nif.pdb')
