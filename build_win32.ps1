@@ -42,14 +42,21 @@ function Invoke-Checked {
     }
 }
 
-# Runs a command with its output captured, and shows that output only if it fails.
+# Runs a command with its output captured, and shows that output only if it fails. A
+# line every half minute says it is still running, for CI that stops a job that has been
+# silent too long.
 function Invoke-Quiet {
-    param([string]$Exe, [string[]]$Arguments)
+    param([string]$Exe, [string[]]$Arguments, [string]$What, [int]$HeartbeatSeconds = 30)
     $out = Join-Path $build 'quiet.out'
     $err = Join-Path $build 'quiet.err'
     $quoted = $Arguments | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }
-    $p = Start-Process -FilePath $Exe -ArgumentList $quoted -NoNewWindow -Wait -PassThru `
+    $p = Start-Process -FilePath $Exe -ArgumentList $quoted -NoNewWindow -PassThru `
         -RedirectStandardOutput $out -RedirectStandardError $err
+    $null = $p.Handle  # without this, Windows PowerShell 5.1 reports no ExitCode
+    $started = Get-Date
+    while (-not $p.WaitForExit($HeartbeatSeconds * 1000)) {
+        Write-Host ("ezstd: {0}, {1:n0}s so far" -f $What, ((Get-Date) - $started).TotalSeconds)
+    }
     if ($p.ExitCode -ne 0) {
         Get-Content $out, $err -ErrorAction SilentlyContinue | Write-Host
         throw "ezstd: '$Exe $($Arguments -join ' ')' failed with exit code $($p.ExitCode)"
@@ -118,7 +125,9 @@ $cflags = @(
 )
 $objects = @()
 foreach ($sub in 'common', 'compress', 'decompress', 'dictBuilder') {
-    foreach ($src in Get-ChildItem (Join-Path $zstdLib $sub) -Filter '*.c') {
+    $sources = Get-ChildItem (Join-Path $zstdLib $sub) -Filter '*.c'
+    Write-Host "ezstd: compiling zstd $sub ($($sources.Count) files)"
+    foreach ($src in $sources) {
         $obj = Join-Path $objDir ($src.BaseName + '.o')
         $objects += $obj
         if ((Test-Path $obj) -and (Get-Item $obj).LastWriteTime -ge $src.LastWriteTime) { continue }
@@ -139,7 +148,7 @@ Set-Content -Path $warm -Encoding ascii -Value @(
     'extern "C" int ezstd_warmup() { std::unique_ptr<int[]> p(new int[1]); return p ? 0 : 1; }'
 )
 Write-Host "ezstd: preparing libc++ for $target"
-Invoke-Quiet zig (@('c++') + $cxxflags + @('-shared', '-s', '-o', (Join-Path $build 'libcxx_warmup.dll'), $warm))
+Invoke-Quiet zig (@('c++') + $cxxflags + @('-shared', '-s', '-o', (Join-Path $build 'libcxx_warmup.dll'), $warm)) -What 'still building libc++'
 
 Write-Host "ezstd: linking $output ($target)"
 $linkflags = $cxxflags + @(
